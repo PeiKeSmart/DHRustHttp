@@ -136,7 +136,6 @@ cargo run -- --help
 - 管理员检测与自动提权：
 	- 程序启动时会检测当前是否拥有管理员权限；若无，将触发 UAC 弹窗以管理员权限重新启动自身，然后退出原进程。
 	- 在企业设备或受组策略限制的环境中，UAC 提权可能被阻止，此时请以“以管理员身份运行”手动启动，或联系管理员。
-	- 管理员重启时会将“工作目录（Working Directory）”设置为 exe 所在目录；程序启动日志会打印“当前工作目录”“可执行文件路径”“可执行文件所在目录”，便于确认。
 
 - 防火墙端口放行：
 	- 选定最终监听端口后（例如 8080 或自动递增得到的 8081），程序会调用 `netsh` 添加入站放行规则，规则命名为：`DHRustHttp-<端口>`，例如 `DHRustHttp-8080`。
@@ -162,20 +161,11 @@ netsh advfirewall firewall add rule name="DHRustHttp-8080" dir=in action=allow p
 - 非 Windows 平台不会进行上述自动提权与防火墙操作。
 
 ## 启用访问日志
-- 本程序使用 `env_logger`，并内置访问日志（包含请求耗时）。使用 `RUST_LOG` 控制输出：
+- 本程序已集成 `env_logger`，可使用 `RUST_LOG` 控制日志级别：
 	```powershell
-	# 输出应用日志以及访问日志（access 目标）
-	$env:RUST_LOG=info,access=info; cargo run
+	$env:RUST_LOG=info; cargo run
 	# 或运行发布版
-	$env:RUST_LOG=info,access=info; .\target\release\DHRustHttp.exe
-	```
-
-### 访问日志格式
-- 日志目标：`access`
-- 字段：`remote` `method` `path` `status` `elapsed_ms` `referer` `user-agent`
-- 示例：
-	```text
-	remote=127.0.0.1:57934 method=GET path=/test.html status=200 elapsed_ms=3 referer=- user-agent=curl/8.6.0
+	$env:RUST_LOG=info; .\target\release\DHRustHttp.exe
 	```
 
 ## 已知限制
@@ -260,11 +250,7 @@ curl -H "Range: bytes=-4096" http://localhost:8080/largefile.zip
 - 基于前端的更丰富文件浏览 UI（缩略图预览、排序切换等）
 - 带宽限速与并发连接数限制
 - 访问控制（基础认证/白名单）
- - 访问日志支持 JSON 格式输出
- - 访问日志自定义格式模板（可选字段与顺序）
- - 打印请求体大小与响应体大小
- - 访问日志写入文件并支持按大小/日期滚动
- - 基于路径或状态码的日志采样/过滤
+- 访问日志格式自定义与文件落盘
 
 ## 常见问题
 - 端口占用：程序会自动尝试下一个端口；也可通过 `--port` 或 `DHRUSTHTTP_PORT` 指定起始端口
