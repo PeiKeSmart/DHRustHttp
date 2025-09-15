@@ -76,14 +76,12 @@ cargo run -- --root "F:\\SomeFolder"
 cargo run -- --disposition attachment
 
 # 参数可组合使用
-cargo run -- --host 127.0.0.1 --port 9000 --max-tries 10 --root . --disposition inline --no-firewall
+cargo run -- --host 127.0.0.1 --port 9000 --max-tries 10 --root . --disposition inline
 ```
 
 ### 命令行参数（运行已打包可执行文件）
 ```powershell
 .\target\release\DHRustHttp.exe --host 127.0.0.1 --port 9000 --max-tries 50 --root . --disposition attachment
-# 在 Windows 上跳过自动放行防火墙规则
-.\target\release\DHRustHttp.exe --no-firewall
 ```
 
 ### 环境变量（PowerShell）
@@ -93,7 +91,6 @@ $env:DHRUSTHTTP_PORT=9000
 $env:DHRUSTHTTP_MAX_TRIES=200
 $env:DHRUSTHTTP_ROOT="F:\\SomeFolder"
 $env:DHRUSTHTTP_DISPOSITION="attachment"
-$env:DHRUSTHTTP_NO_FIREWALL="1"  # Windows：设置任意非空值视为 true
 
 # 开发模式读取环境变量
 cargo run
@@ -108,7 +105,6 @@ cargo run
 - `--max-tries` 或 `DHRUSTHTTP_MAX_TRIES`：最大尝试数量（默认 `100`），从起始端口开始递增探测
 - `--root` 或 `DHRUSTHTTP_ROOT`：服务器根目录（默认当前工作目录）
 - `--disposition` 或 `DHRUSTHTTP_DISPOSITION`：文件返回模式，`inline`（预览）或 `attachment`（下载），默认 `inline`
-- `--no-firewall` 或 `DHRUSTHTTP_NO_FIREWALL`：仅 Windows，禁用自动添加防火墙端口规则（默认关闭）
 
 ## 目录结构
 ```
@@ -129,36 +125,6 @@ cargo run -- --help
 ## 安全提示
 - 程序默认监听 `0.0.0.0:<端口>`，同一局域网设备可访问；如仅需本机访问，可使用 `--host 127.0.0.1` 限制监听地址。
 - Windows 首次运行可能触发防火墙弹窗，请按需允许。
-
-## Windows 特别说明（管理员与防火墙）
-为尽可能减少“端口绑定权限不足（os error 10013）”及网络访问受阻的问题，本程序在 Windows 上做了以下自动处理：
-
-- 管理员检测与自动提权：
-	- 程序启动时会检测当前是否拥有管理员权限；若无，将触发 UAC 弹窗以管理员权限重新启动自身，然后退出原进程。
-	- 在企业设备或受组策略限制的环境中，UAC 提权可能被阻止，此时请以“以管理员身份运行”手动启动，或联系管理员。
-
-- 防火墙端口放行：
-	- 选定最终监听端口后（例如 8080 或自动递增得到的 8081），程序会调用 `netsh` 添加入站放行规则，规则命名为：`DHRustHttp-<端口>`，例如 `DHRustHttp-8080`。
-	- 若规则已存在，程序会忽略该错误并继续运行。
-	- 可通过参数 `--no-firewall` 或环境变量 `DHRUSTHTTP_NO_FIREWALL` 禁用该自动放行行为（企业或受限环境推荐）。
-
-手动维护规则的示例命令（PowerShell）：
-
-```powershell
-# 删除指定端口的规则（按名称）
-netsh advfirewall firewall delete rule name="DHRustHttp-8080"
-
-# 更精确地根据条件删除（入站、TCP、端口）
-netsh advfirewall firewall delete rule name="DHRustHttp-8080" dir=in protocol=TCP localport=8080
-
-# 手动添加一条放行规则（入站、TCP、端口 8080）
-netsh advfirewall firewall add rule name="DHRustHttp-8080" dir=in action=allow protocol=TCP localport=8080
-```
-
-注意：
-- 若端口占用导致程序自动改为其他端口（如 8081），将为“实际使用的端口”创建规则。
-- 放行仅针对端口，不限制程序路径；如需按程序限制，建议改用“通过程序放行”的策略并禁用端口规则。
-- 非 Windows 平台不会进行上述自动提权与防火墙操作。
 
 ## 启用访问日志
 - 本程序已集成 `env_logger`，可使用 `RUST_LOG` 控制日志级别：
@@ -220,19 +186,7 @@ curl -H "Range: bytes=-4096" http://localhost:8080/largefile.zip
 ```powershell
 # 仅监听本机地址，局域网无法访问
 .\target\release\DHRustHttp.exe --host 127.0.0.1
-
-# （Windows）仅本机开发模式，跳过自动添加防火墙规则
-.\target\release\DHRustHttp.exe --host 127.0.0.1 --no-firewall
 ```
-
-仅本机开发模式说明：
-- 使用 `--host 127.0.0.1` 时，只接受来自本机的连接，避免对局域网暴露。
-- 在 Windows 上，本机回环访问通常不需要入站防火墙端口放行；程序即使自动添加了 `DHRustHttp-<端口>` 规则，也可安全删除，不影响本机访问。
-- 如在企业/受限环境中不希望为对外端口添加规则，推荐始终使用本机监听地址；需要时可手动删除该规则：
-	```powershell
-	netsh advfirewall firewall delete rule name="DHRustHttp-8080"
-	```
-	将 `8080` 替换为实际运行端口。
 
 ## 设计说明
 - 使用 `warp` 作为 HTTP 框架，`tokio` 作为异步运行时
@@ -250,13 +204,9 @@ curl -H "Range: bytes=-4096" http://localhost:8080/largefile.zip
 - 基于前端的更丰富文件浏览 UI（缩略图预览、排序切换等）
 - 带宽限速与并发连接数限制
 - 访问控制（基础认证/白名单）
-- 访问日志格式自定义与文件落盘
-
-## 常见问题
+- 访问日志格式自定义与文件落盘## 常见问题
 - 端口占用：程序会自动尝试下一个端口；也可通过 `--port` 或 `DHRUSTHTTP_PORT` 指定起始端口
 - 权限问题（Windows）：如遇 `os error 10013`，尝试以管理员权限运行，或更换端口
-	- 本程序已内置自动提权与自动放行防火墙规则；若 UAC 被策略阻止，请“以管理员身份运行”或让管理员为目标端口手动添加放行规则。
-	- 企业环境下若禁止运行 `netsh` 修改防火墙，程序将继续运行但可能无法被外网访问，此时可改用 `--host 127.0.0.1` 仅本机使用。
 
 ## 许可证
 MIT

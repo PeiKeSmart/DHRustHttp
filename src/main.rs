@@ -10,74 +10,6 @@ use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
-#[cfg(target_os = "windows")]
-mod win_integration {
-    use is_elevated::is_elevated;
-    use runas::Command as RunasCommand;
-
-    pub fn ensure_admin_or_relaunch() {
-        if is_elevated() {
-            return;
-        }
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("无法获取当前可执行路径: {}", e);
-                return;
-            }
-        };
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        println!("检测到非管理员权限，正在申请管理员权限...");
-        match RunasCommand::new(exe).args(&args).gui(false).status() {
-            Ok(_status) => {
-                // 已启动提升权限的新进程，退出当前进程
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("管理员权限申请失败: {}", e);
-            }
-        }
-    }
-
-    pub fn ensure_firewall_open(port: u16) {
-        // 使用唯一规则名，避免冲突
-        let rule_name = format!("DHRustHttp-{}", port);
-        let name_arg = format!("name=\"{}\"", rule_name);
-        let port_arg = format!("localport={}", port);
-
-        // 添加规则（若已存在会失败，但我们将忽略“已存在”的情况）
-        let output = std::process::Command::new("netsh")
-            .args([
-                "advfirewall","firewall","add","rule",
-                &name_arg,
-                "dir=in","action=allow","protocol=TCP",
-                &port_arg,
-            ])
-            .output();
-
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if out.status.success() {
-                    println!("已放行 Windows 防火墙端口 {}", port);
-                } else {
-                    // 若规则已存在，输出通常包含“已存在”或“exists”，此时视为成功
-                    let combined = format!("{}\n{}", stdout, stderr).to_lowercase();
-                    if combined.contains("exist") || combined.contains("已存在") {
-                        println!("防火墙规则已存在：端口 {} 已放行", port);
-                    } else {
-                        eprintln!("放行防火墙端口失败（可忽略，若已手工放行）：{}", combined.trim());
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("执行 netsh 失败：{}（可忽略，若已手工放行）", e);
-            }
-        }
-    }
-}
-
 // 查找可用端口，从默认端口开始递增
 fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16) -> Result<u16, String> {
     println!("正在检查端口可用性...");
@@ -135,10 +67,6 @@ struct Cli {
     /// Content-Disposition 策略（inline/attachment），默认 inline
     #[arg(long = "disposition", env = "DHRUSTHTTP_DISPOSITION", value_enum, default_value_t = DispositionMode::Inline)]
     disposition: DispositionMode,
-
-    ///（Windows）禁用自动添加防火墙规则
-    #[arg(long = "no-firewall", env = "DHRUSTHTTP_NO_FIREWALL", default_value_t = false)]
-    no_firewall: bool,
 }
 
 #[tokio::main]
@@ -147,12 +75,6 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
-
-    // Windows: 若非管理员则提权重启自身
-    #[cfg(target_os = "windows")]
-    {
-        win_integration::ensure_admin_or_relaunch();
-    }
 
     let default_port = cli.port;
     let max_tries = cli.max_tries;
@@ -211,16 +133,6 @@ async fn main() {
         .with(warp::cors().allow_any_origin())
         .with(warp::log("http_server"));
     
-    // Windows: 放行防火墙端口（若规则已存在将忽略）
-    #[cfg(target_os = "windows")]
-    {
-        if cli.no_firewall {
-            println!("已按参数 --no-firewall 跳过自动放行防火墙端口 {}", available_port);
-        } else {
-            win_integration::ensure_firewall_open(available_port);
-        }
-    }
-
     println!("HTTP 服务器已启动！");
     println!("访问 http://{}:{} 或 http://localhost:{} 查看文件列表", host_ip, available_port, available_port);
     println!("按 Ctrl+C 停止服务器");
