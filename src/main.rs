@@ -144,9 +144,16 @@ async fn main() {
     println!("按 Ctrl+C 停止服务器");
     
     let addr = SocketAddr::from((host_ip, available_port));
-    warp::serve(routes)
-        .run(addr)
-        .await;
+    
+    // 创建服务器
+    let (_, server) = warp::serve(routes).bind_with_graceful_shutdown(addr, async {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
+        println!("\n正在优雅关闭服务器...");
+    });
+    
+    // 运行服务器
+    server.await;
+    println!("服务器已优雅关闭");
 }
 
 // 处理文件请求
