@@ -108,9 +108,15 @@ async fn main() {
         std::env::current_dir().expect("无法获取当前目录")
     };
 
-    // 规范化根目录
+    // 规范化根目录，但去掉Windows的UNC路径前缀
     let root_abs = current_dir.canonicalize().unwrap_or(current_dir);
-    println!("服务器根目录: {}", root_abs.display());
+    let display_path = if cfg!(windows) {
+        // 在Windows上去掉 \\?\ 前缀，使路径更易读
+        root_abs.to_string_lossy().strip_prefix(r"\\?\").unwrap_or(&root_abs.to_string_lossy()).to_string()
+    } else {
+        root_abs.display().to_string()
+    };
+    println!("服务器根目录: {}", display_path);
 
     let config = AppConfig { root: root_abs, disposition: cli.disposition };
     let cfg_filter = warp::any().map(move || config.clone());
