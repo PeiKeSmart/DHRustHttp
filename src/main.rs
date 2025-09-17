@@ -10,8 +10,88 @@ use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
-// 查找可用端口，从默认端口开始递增
-fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16) -> Result<u16, String> {
+// Windows防火墙管理功能
+#[cfg(windows)]
+mod firewall {
+    use std::process::Command;
+
+    const RULE_NAME_PREFIX: &str = "DHRustHttp-Port-";
+
+    // 检查指定端口的防火墙规则是否存在
+    pub fn check_firewall_rule_exists(port: u16) -> bool {
+        let rule_name = format!("{}{}", RULE_NAME_PREFIX, port);
+        
+        let output = Command::new("netsh")
+            .args(&[
+                "advfirewall", "firewall", "show", "rule", 
+                &format!("name={}", rule_name)
+            ])
+            .output();
+
+        match output {
+            Ok(result) => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                // 如果输出包含规则名称，说明规则存在
+                stdout.contains(&rule_name)
+            }
+            Err(_) => false,
+        }
+    }
+
+    // 添加防火墙规则
+    pub fn add_firewall_rule(port: u16) -> Result<(), String> {
+        let rule_name = format!("{}{}", RULE_NAME_PREFIX, port);
+        
+        println!("正在为端口 {} 添加防火墙规则...", port);
+        
+        let output = Command::new("netsh")
+            .args(&[
+                "advfirewall", "firewall", "add", "rule",
+                &format!("name={}", rule_name),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={}", port),
+                "description=DHRustHttp HTTP Server Port"
+            ])
+            .output();
+
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    println!("成功添加防火墙规则: {}", rule_name);
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    Err(format!("添加防火墙规则失败: {}", stderr))
+                }
+            }
+            Err(e) => Err(format!("执行netsh命令失败: {}", e)),
+        }
+    }
+
+    // 检查并确保端口通过防火墙
+    pub fn ensure_port_allowed(port: u16) -> Result<(), String> {
+        if check_firewall_rule_exists(port) {
+            println!("端口 {} 的防火墙规则已存在", port);
+            Ok(())
+        } else {
+            add_firewall_rule(port)
+        }
+    }
+}
+
+// 非Windows平台的空实现
+#[cfg(not(windows))]
+mod firewall {
+    pub fn ensure_port_allowed(_port: u16) -> Result<(), String> {
+        // 非Windows平台不需要防火墙检查
+        Ok(())
+    }
+}
+
+// 查找可用端口，从默认端口开始递增，并确保防火墙允许
+fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16, skip_firewall: bool) -> Result<u16, String> {
     println!("正在检查端口可用性...");
 
     let end = start_port.saturating_add(max_tries);
@@ -23,7 +103,26 @@ fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16) -> Result<
                 } else {
                     println!("端口 {} 可用", port);
                 }
-                return Ok(port);
+                
+                // 检查并确保防火墙允许此端口（如果未跳过）
+                if !skip_firewall {
+                    match firewall::ensure_port_allowed(port) {
+                        Ok(_) => {
+                            println!("端口 {} 防火墙检查通过", port);
+                            return Ok(port);
+                        }
+                        Err(e) => {
+                            println!("端口 {} 防火墙配置失败: {}", port, e);
+                            println!("注意: 可能需要管理员权限来修改防火墙设置");
+                            println!("提示: 使用 --skip-firewall 参数跳过防火墙检查");
+                            // 继续使用这个端口，但给用户警告
+                            return Ok(port);
+                        }
+                    }
+                } else {
+                    println!("已跳过端口 {} 的防火墙检查", port);
+                    return Ok(port);
+                }
             }
             Err(_) => {
                 println!("端口 {} 被占用，尝试下一个端口...", port);
@@ -67,6 +166,10 @@ struct Cli {
     /// Content-Disposition 策略（inline/attachment），默认 inline
     #[arg(long = "disposition", env = "DHRUSTHTTP_DISPOSITION", value_enum, default_value_t = DispositionMode::Inline)]
     disposition: DispositionMode,
+
+    /// 跳过防火墙检查和配置
+    #[arg(long = "skip-firewall", env = "DHRUSTHTTP_SKIP_FIREWALL")]
+    skip_firewall: bool,
 }
 
 #[tokio::main]
@@ -87,7 +190,7 @@ async fn main() {
         }
     };
 
-    let available_port = match find_available_port(host_ip, default_port, max_tries) {
+    let available_port = match find_available_port(host_ip, default_port, max_tries, cli.skip_firewall) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("查找可用端口失败: {}", e);
