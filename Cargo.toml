@@ -18,3 +18,19 @@ windows-sys = { version = "0.52", features = [
 	"Win32_UI_Shell"
 ] }
 ctrlc = "3.4"
+
+[profile.release]
+# 启用链接时优化，显著减小二进制大小
+lto = true
+# 优化目标：最小化大小
+opt-level = "s"
+# 移除调试信息
+debug = false
+# 启用strip移除符号表
+strip = true
+# 使用abort而不是unwind来处理panic，减小代码大小
+panic = "abort"
+# 启用代码生成优化
+codegen-units = 1
+# 启用溢出检查（release模式默认关闭，但为了安全保留）
+overflow-checks = true

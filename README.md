@@ -11,9 +11,39 @@
 - 可选启动后自动打开浏览器
 
 ## 安装与构建
+
+### 标准构建
 ```bash
 cargo build --release
 ```
+
+### 优化构建（推荐）
+项目已配置了优化的release配置，包括：
+- LTO (Link Time Optimization) 链接时优化
+- 最小化二进制大小优化 (`opt-level = "s"`)
+- 移除调试信息和符号表
+- panic处理优化
+
+```bash
+# 构建优化版本
+cargo build --release
+
+# 使用UPX进一步压缩（可选，需先安装UPX）
+# 从 ~2.2MB 压缩到 ~700KB (压缩率 ~32%)
+upx --best --lzma target/release/DHRustHttp.exe
+```
+
+### 自动化构建脚本
+```bash
+# Windows: 使用提供的批处理脚本
+.\build_release.bat
+```
+
+## 性能优化说明
+- **LTO**: 显著减小二进制大小，提高运行时性能
+- **代码生成单元**: 设置为1个单元以获得最佳优化
+- **剥离**: 移除所有调试符号和不必要的元数据
+- **UPX压缩**: 可进一步将二进制大小减少至原来的32%
 
 ## 命令行参数
 | 参数 | 说明 | 默认 |
