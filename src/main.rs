@@ -170,14 +170,68 @@ struct Cli {
     /// 跳过防火墙检查和配置
     #[arg(long = "skip-firewall", env = "DHRUSTHTTP_SKIP_FIREWALL")]
     skip_firewall: bool,
+    /// 禁用自动管理员自提升
+    #[arg(long = "no-elevate", env = "DHRUSTHTTP_NO_ELEVATE")]
+    no_elevate: bool,
+    /// 启动后自动打开浏览器
+    #[arg(long = "open-browser", env = "DHRUSTHTTP_OPEN_BROWSER")]
+    open_browser: bool,
+    /// (内部使用) 标记已提升
+    #[arg(long = "__elevated", hide = true, default_value_t = false)]
+    __elevated: bool,
+    /// (内部使用) 原始工作目录
+    #[arg(long = "__orig_cwd", hide = true)]
+    __orig_cwd: Option<String>,
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志（支持 RUST_LOG）
     env_logger::init();
-
     let cli = Cli::parse();
+
+    #[cfg(windows)]
+    {
+        use crate::elevation;
+        if !cli.no_elevate && !cli.__elevated {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let cwd_str = cwd.to_string_lossy().to_string();
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            if !elevation::is_elevated() {
+                println!("(未提升) 尝试以管理员权限重新启动。可以使用 --no-elevate 禁用此行为。");
+                match elevation::relaunch_as_admin(&args, &cwd_str) {
+                    Ok(_) => { return; }
+                    Err(e) => eprintln!("自提升失败: {}\n继续以当前权限运行", e),
+                }
+            }
+        }
+        if cli.__elevated {
+            if let Some(orig) = &cli.__orig_cwd {
+                if let Err(e) = std::env::set_current_dir(orig) {
+                    eprintln!("恢复原工作目录失败: {}", e);
+                } else {
+                    println!("已恢复原工作目录: {}", orig);
+                }
+            }
+        }
+    }
 
     let default_port = cli.port;
     let max_tries = cli.max_tries;
@@ -237,26 +291,70 @@ async fn main() {
         .and(cfg_filter.clone())
         .and_then(serve_directory);
     
-    // 组合所有路由
-    let routes = root.or(files)
+    // 组合所有路由（shutdown 路由稍后加入，因为需要 tx_cell）
+    let base_routes = root.or(files)
         .with(warp::cors().allow_any_origin())
         .with(warp::log("http_server"));
     
     println!("HTTP 服务器已启动！");
     println!("访问 http://{}:{} 或 http://localhost:{} 查看文件列表", host_ip, available_port, available_port);
-    println!("按 Ctrl+C 停止服务器");
-    
+    println!("按 Ctrl+C 停止服务器，输入 q 回车优雅退出，或访问 http://localhost:{}/__shutdown", available_port);
+
+    if cli.open_browser {
+        let url = format!("http://localhost:{}", available_port);
+        println!("正在打开浏览器: {} (可用 --open-browser 控制)", url);
+        open_browser(&url);
+    }
+
     let addr = SocketAddr::from((host_ip, available_port));
-    
-    // 创建服务器
-    let (_, server) = warp::serve(routes).bind_with_graceful_shutdown(addr, async {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
-        println!("\n正在优雅关闭服务器...");
+
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+    use tokio::sync::oneshot;
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let shutdown_done = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = oneshot::channel::<()>();
+    let tx_cell = Arc::new(Mutex::new(Some(tx)));
+    {
+        let shutting_down = shutting_down.clone();
+        let tx_cell = tx_cell.clone();
+        let shutdown_done = shutdown_done.clone();
+        ctrlc::set_handler(move || {
+            if !shutting_down.swap(true, Ordering::SeqCst) {
+                println!("\n收到 Ctrl+C，正在优雅关闭...");
+                if let Some(sender) = tx_cell.lock().ok().and_then(|mut g| g.take()) {
+                    let _ = sender.send(());
+                }
+                // 等待优雅关闭完成（最多 5 秒），然后以 0 退出
+                let start = std::time::Instant::now();
+                while !shutdown_done.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(5) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                std::process::exit(0);
+            }
+        }).expect("无法注册 Ctrl+C 处理程序");
+    }
+
+    // 增加 HTTP 本地关闭路由 /__shutdown
+    let tx_filter = {
+        let tx_cell = tx_cell.clone();
+        warp::any().map(move || tx_cell.clone())
+    };
+    let shutdown_route = warp::path("__shutdown")
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(tx_filter)
+        .and_then(shutdown_handler);
+    let routes = base_routes.or(shutdown_route);
+
+    let (addr_bound, server_fut) = warp::serve(routes).bind_with_graceful_shutdown(addr, async {
+        let _ = rx.await; // 等待信号
     });
-    
-    // 运行服务器
-    server.await;
+    println!("监听地址: {}", addr_bound);
+
+    server_fut.await;
     println!("服务器已优雅关闭");
+    shutdown_done.store(true, Ordering::SeqCst);
+    return; // 正常结束
 }
 
 // 处理文件请求
@@ -456,5 +554,79 @@ fn parse_range(range: &str, file_len: u64) -> Option<(u64, u64)> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(windows)]
+mod elevation {
+    use windows_sys::Win32::Foundation::{HANDLE, CloseHandle};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // 检测当前进程是否已提升(管理员)
+    pub fn is_elevated() -> bool {
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut token: HANDLE = 0;
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 { return false; }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut ret_len: u32 = 0;
+            let res = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut _ as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut ret_len
+            );
+            CloseHandle(token);
+            if res == 0 { return false; }
+            elevation.TokenIsElevated != 0
+        }
+    }
+
+    // 以管理员权限重新启动 (调用 powershell Start-Process -Verb RunAs)
+    pub fn relaunch_as_admin(args: &[String], cwd: &str) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        // 重建参数并附加内部标记
+        let mut rebuilt: Vec<String> = Vec::new();
+        rebuilt.push("--__elevated".to_string());
+        rebuilt.push(format!("--__orig_cwd={}", cwd));
+        for a in args {
+            if a.starts_with("--__elevated") || a.starts_with("--__orig_cwd=") { continue; }
+            rebuilt.push(a.clone());
+        }
+        // 在 PowerShell 中执行: Start-Process <exe> -Verb RunAs -WorkingDirectory <cwd> -ArgumentList 'arg1','arg2'
+        let arg_list = rebuilt.iter().map(|s| format!("'{}'", s.replace("'", "''"))).collect::<Vec<_>>().join(",");
+        let ps_cmd = format!(
+            "Start-Process -FilePath '{}' -Verb RunAs -WorkingDirectory '{}' -ArgumentList {}",
+            exe.display(), cwd.replace("'", "''"), arg_list
+        );
+        let status = std::process::Command::new("powershell")
+            .arg("-NoProfile").arg("-Command").arg(ps_cmd)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() { return Err(format!("提升进程启动失败, 状态: {:?}", status)); }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod elevation {
+    pub fn is_elevated() -> bool { true }
+    pub fn relaunch_as_admin(_args: &[String], _cwd: &str) -> Result<(), String> { Ok(()) }
+}
+
+async fn shutdown_handler(remote: Option<SocketAddr>, tx_cell: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>) -> Result<impl Reply, Rejection> {
+    // 仅允许来自本机的请求触发关闭
+    if let Some(addr) = remote {
+        if !(addr.ip().is_loopback() || addr.ip().is_unspecified()) {
+            return Ok(warp::reply::with_status("forbidden", StatusCode::FORBIDDEN));
+        }
+    }
+    if let Some(sender) = tx_cell.lock().ok().and_then(|mut g| g.take()) {
+        let _ = sender.send(());
+        Ok(warp::reply::with_status("shutting down", StatusCode::OK))
+    } else {
+        Ok(warp::reply::with_status("already shutting down", StatusCode::OK))
     }
 }
