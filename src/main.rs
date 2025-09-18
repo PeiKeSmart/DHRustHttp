@@ -39,7 +39,7 @@ mod firewall {
     }
 
     // 添加防火墙规则
-    pub fn add_firewall_rule(port: u16) -> Result<(), String> {
+    pub fn add_firewall_rule(port: u16, lazy_elevate: bool) -> Result<(), String> {
         let rule_name = format!("{}{}", RULE_NAME_PREFIX, port);
         
         println!("正在为端口 {} 添加防火墙规则...", port);
@@ -63,20 +63,45 @@ mod firewall {
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&result.stderr);
-                    Err(format!("添加防火墙规则失败: {}", stderr))
+                    // 若开启懒提权（默认），则尝试后台以管理员执行 netsh 添加规则，避免阻塞或重启主进程
+                    if lazy_elevate {
+                        println!("普通方式添加防火墙失败，尝试以管理员后台添加规则(懒提权)...");
+                        match crate::elevation::spawn_elevated_netsh_add_rule(&rule_name, port) {
+                            Ok(_) => {
+                                println!("已请求管理员后台添加防火墙规则: {} (可能会弹出UAC)", rule_name);
+                                // 不再阻塞等待结果，直接返回 Ok，让服务器继续启动
+                                Ok(())
+                            }
+                            Err(e) => Err(format!("后台添加防火墙规则请求失败: {} (原错误: {})", e, stderr)),
+                        }
+                    } else {
+                        Err(format!("添加防火墙规则失败: {}", stderr))
+                    }
                 }
             }
-            Err(e) => Err(format!("执行netsh命令失败: {}", e)),
+            Err(e) => {
+                // 执行 netsh 本身失败。若懒提权开启，亦尝试后台管理员执行。
+                if lazy_elevate {
+                    println!("普通方式执行 netsh 失败，尝试以管理员后台添加规则(懒提权)...");
+                    let rule_name = format!("{}{}", RULE_NAME_PREFIX, port);
+                    match crate::elevation::spawn_elevated_netsh_add_rule(&rule_name, port) {
+                        Ok(_) => Ok(()),
+                        Err(err2) => Err(format!("后台添加防火墙规则请求失败: {} (原执行错误: {})", err2, e)),
+                    }
+                } else {
+                    Err(format!("执行netsh命令失败: {}", e))
+                }
+            }
         }
     }
 
     // 检查并确保端口通过防火墙
-    pub fn ensure_port_allowed(port: u16) -> Result<(), String> {
+    pub fn ensure_port_allowed(port: u16, lazy_elevate: bool) -> Result<(), String> {
         if check_firewall_rule_exists(port) {
             println!("端口 {} 的防火墙规则已存在", port);
             Ok(())
         } else {
-            add_firewall_rule(port)
+            add_firewall_rule(port, lazy_elevate)
         }
     }
 }
@@ -84,14 +109,14 @@ mod firewall {
 // 非Windows平台的空实现
 #[cfg(not(windows))]
 mod firewall {
-    pub fn ensure_port_allowed(_port: u16) -> Result<(), String> {
+    pub fn ensure_port_allowed(_port: u16, _lazy_elevate: bool) -> Result<(), String> {
         // 非Windows平台不需要防火墙检查
         Ok(())
     }
 }
 
 // 查找可用端口，从默认端口开始递增，并确保防火墙允许
-fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16, skip_firewall: bool) -> Result<u16, String> {
+fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16, skip_firewall: bool, lazy_elevate: bool) -> Result<u16, String> {
     println!("正在检查端口可用性...");
 
     let end = start_port.saturating_add(max_tries);
@@ -106,7 +131,7 @@ fn find_available_port(host: IpAddr, start_port: u16, max_tries: u16, skip_firew
                 
                 // 检查并确保防火墙允许此端口（如果未跳过）
                 if !skip_firewall {
-                    match firewall::ensure_port_allowed(port) {
+                    match firewall::ensure_port_allowed(port, lazy_elevate) {
                         Ok(_) => {
                             println!("端口 {} 防火墙检查通过", port);
                             return Ok(port);
@@ -170,7 +195,10 @@ struct Cli {
     /// 跳过防火墙检查和配置
     #[arg(long = "skip-firewall", env = "DHRUSTHTTP_SKIP_FIREWALL")]
     skip_firewall: bool,
-    /// 禁用自动管理员自提升
+    /// 启动时整进程重启提权（传统模式，会切换窗口）
+    #[arg(long = "eager-elevate", env = "DHRUSTHTTP_EAGER_ELEVATE")]
+    eager_elevate: bool,
+    /// 禁用所有提权行为
     #[arg(long = "no-elevate", env = "DHRUSTHTTP_NO_ELEVATE")]
     no_elevate: bool,
     /// 启动后自动打开浏览器
@@ -210,7 +238,8 @@ async fn main() {
     #[cfg(windows)]
     {
         use crate::elevation;
-        if !cli.no_elevate && !cli.__elevated {
+        // 默认使用懒提权，只有明确指定 --eager-elevate 才进行整进程重启
+        if cli.eager_elevate && !cli.no_elevate && !cli.__elevated {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let cwd_str = cwd.to_string_lossy().to_string();
             let args: Vec<String> = std::env::args().skip(1).collect();
@@ -244,7 +273,7 @@ async fn main() {
         }
     };
 
-    let available_port = match find_available_port(host_ip, default_port, max_tries, cli.skip_firewall) {
+    let available_port = match find_available_port(host_ip, default_port, max_tries, cli.skip_firewall, !cli.no_elevate) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("查找可用端口失败: {}", e);
@@ -608,12 +637,38 @@ mod elevation {
         if !status.success() { return Err(format!("提升进程启动失败, 状态: {:?}", status)); }
         Ok(())
     }
+
+    // 懒提权：以管理员后台执行 netsh 添加规则，不重启主进程
+    pub fn spawn_elevated_netsh_add_rule(rule_name: &str, port: u16) -> Result<(), String> {
+        // 构造 netsh 命令文本
+        let netsh = format!(
+            "netsh advfirewall firewall add rule name=\"{}\" dir=in action=allow protocol=TCP localport={} description=\"DHRustHttp HTTP Server Port\"",
+            rule_name, port
+        );
+
+        // 用 PowerShell 以管理员执行该命令；使用 -WindowStyle Hidden 降低打扰
+        // 注意：这里依然会触发一次 UAC，但不会重启本进程
+        let ps_cmd = format!(
+            "Start-Process -FilePath 'powershell' -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
+            netsh.replace("'", "''")
+        );
+
+        let status = std::process::Command::new("powershell")
+            .arg("-NoProfile").arg("-Command").arg(ps_cmd)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!("启动管理员 netsh 失败, 状态: {:?}", status));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
 mod elevation {
     pub fn is_elevated() -> bool { true }
     pub fn relaunch_as_admin(_args: &[String], _cwd: &str) -> Result<(), String> { Ok(()) }
+    pub fn spawn_elevated_netsh_add_rule(_rule_name: &str, _port: u16) -> Result<(), String> { Ok(()) }
 }
 
 async fn shutdown_handler(remote: Option<SocketAddr>, tx_cell: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>) -> Result<impl Reply, Rejection> {
